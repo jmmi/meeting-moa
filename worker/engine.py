@@ -1,6 +1,6 @@
 """Moa: offline audio processing and subscription-backed meeting intelligence."""
 from __future__ import annotations
-import json, os, signal, subprocess, sys, tempfile, uuid
+import json, os, re, signal, subprocess, sys, tempfile, uuid
 from pathlib import Path
 
 ROOT = Path.home() / 'Library/Application Support/MoaMeeting'
@@ -62,29 +62,54 @@ def speaker_at(start, end, turns):
             return closest['speaker']
     return 'unknown'
 
-def align_segments(transcription, turns, duration):
+def words(segment):
+    """Join Whisper sub-word tokens into words so a speaker change never splits a word."""
+    tokens = [t for t in segment.get('tokens', []) if t.get('text','').strip()
+              and not t.get('text','').strip().startswith('[_')]
+    # Whisper sometimes emits real words with zero-duration offsets. Keep every
+    # word; timestamps are alignment hints, never a reason to drop content.
+    if not tokens or ''.join(t['text'] for t in tokens).strip() != segment.get('text','').strip():
+        return [segment]
     result = []
+    for t in tokens:
+        if result and not t['text'].startswith(' '):
+            result[-1]['text'] += t['text']
+            result[-1]['offsets'] = dict(result[-1]['offsets'], to=t['offsets'].get('to', 0))
+        else:
+            result.append(dict(text=t['text'], offsets=dict(t.get('offsets', segment.get('offsets', {})))))
+    return result
+
+def clean_text(text):
+    """Remove subtitle dashes and the loops Whisper produces on long or noisy audio."""
+    text = re.sub(r'(^|\s)-+(?!\d)\s*', r'\1', text)
+    text = re.sub(r'(\S)\1{4,}', r'\1\1\1', text)
+    text = re.sub(r'(\S.{0,40}?)(?:[\s,.?!~]+\1){3,}', r'\1', text)
+    return re.sub(r'\s{2,}', ' ', text).strip()
+
+def align_segments(transcription, turns, duration):
+    result, previous = [], None
     for segment in transcription:
-        # Whisper sometimes emits real words with zero-duration offsets. Keep every
-        # word; timestamps are alignment hints, never a reason to drop content.
-        units = [t for t in segment.get('tokens', []) if t.get('text','').strip()
-                 and not t.get('text','').strip().startswith('[_')]
-        if not units or ''.join(t['text'] for t in units).strip() != segment.get('text','').strip():
-            units = [segment]
-        for unit in units:
+        key = re.sub(r'[\W_]+', '', segment.get('text',''))
+        if key and key == previous: continue  # the same line again is a decoding loop
+        previous = key
+        last = None
+        for unit in words(segment):
             text = unit.get('text','')
-            if not text.strip() or text.strip().startswith('[_'): continue
+            if not text.strip() or text.strip().startswith('[_') or not re.sub(r'[-\s]', '', text): continue
             offsets = unit.get('offsets', segment.get('offsets', {}))
             start = min(max(0,offsets.get('from',0)/1000), max(0,duration-.01))
             end = min(duration, max(start+.01, offsets.get('to',0)/1000))
             speaker = speaker_at(start, end, turns)
+            if speaker == 'unknown' and last and start-last['end'] < 1:
+                speaker = last['speaker']  # a word inside the same phrase
             if result and result[-1]['speaker'] == speaker and start-result[-1]['end'] < 1.4 and end-result[-1]['start'] < 22:
                 result[-1]['text'] += text
                 result[-1]['end'] = max(result[-1]['end'],end)
             else:
                 result.append(dict(id=str(uuid.uuid4()), start=start, end=end, speaker=speaker, text=text))
-    for s in result: s['text'] = s['text'].strip()
-    return result
+            last = result[-1]
+    for s in result: s['text'] = clean_text(s['text'])
+    return [s for s in result if s['text']]
 
 def merge_speakers(turns, samples, sr, extractor, merge=.7, min_share=.01, min_seconds=10.):
     """Fold the fragments that automatic clustering leaves on long recordings.
@@ -161,7 +186,7 @@ def transcribe(request, progress):
         progress('한국어 대화록 작성 중', .46)
         output = Path(temp)/'transcript'
         run([binary('whisper-cli'),'-m',str(MODELS/'ggml-large-v3-turbo-q5_0.bin'),'-f',str(wav),
-             '-l',request.get('language','ko'),'-ojf','-of',str(output),'-t','6','-ml','80','-sow'])
+             '-l',request.get('language','ko'),'-ojf','-of',str(output),'-t','6','-ml','80','-sow','-mc','0'])
         raw = json.loads(output.with_suffix('.json').read_text())
         segments = align_segments(raw.get('transcription', []), turns, duration)
         if not segments: raise RuntimeError('인식된 대화가 없습니다. 녹음 상태를 확인해주세요.')
